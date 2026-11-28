@@ -1,0 +1,1852 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4"><Item class="Workspace" referent="RBX1"><Properties><string name="Name">Workspace</string></Properties></Item><Item class="ReplicatedStorage" referent="RBX2"><Properties><string name="Name">ReplicatedStorage</string></Properties><Item class="ModuleScript" referent="RBX3"><Properties><string name="Name">Config</string><ProtectedString name="Source"><![CDATA[--!strict
+-- ReplicatedStorage/Config (ModuleScript)
+-- Single source of truth for tuning values shared by server and client.
+
+local Config = {
+	RemoteName = "CombatRemote",
+	FXRemoteName = "CombatFX",
+
+	ArenaRadius = 120,
+	RespawnTime = 4,
+
+	WalkSpeed = 16,
+	ActionSpeed = 9,
+	BlockSpeed = 7,
+	StunSpeed = 3,
+
+	AssistWindow = 10, -- seconds a last-hit still counts as a kill
+	MinRequestInterval = 0.05, -- per-player server rate limit
+
+	M1 = {
+		Damage = { 8, 8, 14 },
+		Cooldowns = { 0.36, 0.36, 0.8 },
+		HitDelay = { 0.17, 0.17, 0.38 }, -- matches the strike keyframe of each animation
+		Knockback = { 14, 14, 42 },
+		Stun = { 0.25, 0.25, 0.55 },
+		Range = 7.5,
+		MinDot = 0.3,
+		ComboWindow = 0.9,
+	},
+
+	Dash = { Cooldown = 2.5, Speed = 75, Duration = 0.22, IFrames = 0.25 },
+
+	Block = { DamageMultiplier = 0.15, KnockbackMultiplier = 0.2 },
+
+	Shockwave = {
+		Cooldown = 9,
+		Radius = 16,
+		Damage = 18,
+		HitDelay = 0.47,
+		Knockback = 60,
+		Stun = 0.9,
+		LockTime = 1.05,
+	},
+
+	-- Fill with verified Roblox sound asset IDs, e.g. "rbxassetid://123456".
+	-- Left empty on purpose: no sound IDs were verified, so none are invented.
+	Sounds = { M1 = "", Hit = "", Block = "", Dash = "", Shockwave = "" },
+}
+
+return Config
+]]></ProtectedString></Properties></Item><Item class="ModuleScript" referent="RBX4"><Properties><string name="Name">ProceduralAnimator</string><ProtectedString name="Source"><![CDATA[-- ReplicatedStorage/ProceduralAnimator (ModuleScript)
+-- Code-driven R15 animation: writes Motor6D.Transform every frame for every character
+-- the local client can see (locomotion + keyframed combat actions). No uploaded assets.
+--
+-- Joint math (R15, joint spaces are axis-aligned with the character):
+--   +X rotation on shoulder/hip swings the limb FORWARD, on elbow flexes the forearm forward,
+--   on knee (negative) bends the shin backward. +Z on the RIGHT arm/leg moves it outward.
+--   Negative X on Waist/Root leans the body forward. Negative Y on Waist turns right.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local rad, sin, cos, abs, max, clamp, exp = math.rad, math.sin, math.cos, math.abs, math.max, math.clamp, math.exp
+
+local function A(x, y, z)
+	return CFrame.Angles(rad(x or 0), rad(y or 0), rad(z or 0))
+end
+local function T(x, y, z)
+	return CFrame.new(x or 0, y or 0, z or 0)
+end
+local I = CFrame.new()
+
+local JOINTS = {
+	"Root", "Waist", "Neck",
+	"RightShoulder", "RightElbow", "RightWrist",
+	"LeftShoulder", "LeftElbow", "LeftWrist",
+	"RightHip", "RightKnee", "RightAnkle",
+	"LeftHip", "LeftKnee", "LeftAnkle",
+}
+
+local EASE = {
+	inout = function(x) return x * x * (3 - 2 * x) end,
+	["in"] = function(x) return x * x * x end,
+	out = function(x) return 1 - (1 - x) ^ 3 end,
+}
+
+local function full(over)
+	local p = {}
+	for _, j in ipairs(JOINTS) do
+		p[j] = I
+	end
+	for k, v in pairs(over) do
+		p[k] = v
+	end
+	return p
+end
+
+----------------------------------------------------------------------
+-- STATIC POSES
+----------------------------------------------------------------------
+
+local AIR_JUMP = full({
+	Waist = A(-4), Neck = A(4),
+	RightShoulder = A(120, 0, 25), LeftShoulder = A(120, 0, -25),
+	RightElbow = A(25), LeftElbow = A(25),
+	RightHip = A(38), RightKnee = A(-65), RightAnkle = A(16),
+	LeftHip = A(-12), LeftKnee = A(-35), LeftAnkle = A(28),
+})
+
+local AIR_FALL = full({
+	Waist = A(4), Neck = A(-2),
+	RightShoulder = A(40, 0, 60), LeftShoulder = A(40, 0, -60),
+	RightElbow = A(15), LeftElbow = A(15),
+	RightHip = A(22, 0, 5), RightKnee = A(-25), RightAnkle = A(10),
+	LeftHip = A(-8, 0, -5), LeftKnee = A(-18), LeftAnkle = A(10),
+})
+
+local LAND = full({
+	Root = T(0, -0.55, 0),
+	Waist = A(-18), Neck = A(12),
+	RightShoulder = A(30, 0, 10), LeftShoulder = A(30, 0, -10),
+	RightElbow = A(25), LeftElbow = A(25),
+	RightHip = A(60), RightKnee = A(-95), RightAnkle = A(35),
+	LeftHip = A(55), LeftKnee = A(-90), LeftAnkle = A(35),
+})
+
+-- Fighting guard used as the neutral key of every combat action (upper body + root only).
+local GUARD = {
+	Root = I, Waist = A(-5), Neck = A(5),
+	RightShoulder = A(35, 0, -12), RightElbow = A(105), RightWrist = I,
+	LeftShoulder = A(40, 0, 12), LeftElbow = A(100), LeftWrist = I,
+}
+local LEGS_ZERO = {
+	RightHip = I, RightKnee = I, RightAnkle = I,
+	LeftHip = I, LeftKnee = I, LeftAnkle = I,
+}
+
+local function pose(over, withLegs)
+	local p = {}
+	for k, v in pairs(GUARD) do
+		p[k] = v
+	end
+	if withLegs then
+		for k, v in pairs(LEGS_ZERO) do
+			p[k] = v
+		end
+	end
+	for k, v in pairs(over) do
+		p[k] = v
+	end
+	return p
+end
+
+----------------------------------------------------------------------
+-- ACTIONS (key poses: anticipation -> strike -> follow-through -> recover)
+----------------------------------------------------------------------
+
+local DASH_POSE = pose({
+	Root = T(0, -0.2, 0) * A(-28),
+	Waist = A(-10), Neck = A(22),
+	RightShoulder = A(-70, 0, 20), LeftShoulder = A(-70, 0, -20),
+	RightElbow = A(30), LeftElbow = A(30),
+	RightHip = A(55), RightKnee = A(-20), RightAnkle = A(-35),
+	LeftHip = A(-38), LeftKnee = A(-60), LeftAnkle = A(45),
+}, true)
+
+local QUAKE_CROUCH = {
+	RightHip = A(70), RightKnee = A(-120), RightAnkle = A(50),
+	LeftHip = A(60), LeftKnee = A(-115), LeftAnkle = A(55),
+}
+
+local function withQuakeLegs(over)
+	local p = pose(over, true)
+	for k, v in pairs(QUAKE_CROUCH) do
+		p[k] = v
+	end
+	return p
+end
+
+local BLOCK_POSE = pose({
+	Root = T(0, -0.25, 0),
+	Waist = A(-10), Neck = A(8),
+	RightShoulder = A(60, 0, -25), LeftShoulder = A(60, 0, 25),
+	RightElbow = A(125), LeftElbow = A(125),
+})
+
+local HIT_POSE = pose({
+	Root = T(0, 0, 0.12) * A(6),
+	Waist = A(14), Neck = A(22),
+	RightShoulder = A(20, 0, 30), LeftShoulder = A(20, 0, -30),
+	RightElbow = A(45), LeftElbow = A(45),
+})
+
+local Actions = {
+	M1_1 = {
+		dur = 0.40, fadeIn = 0.05, fadeOut = 0.10,
+		keys = {
+			{ t = 0, pose = pose({}) },
+			{ t = 0.11, ease = "out", pose = pose({ Root = T(0, -0.05, 0.1) * A(0, -6), Waist = A(-4, -24), Neck = A(5, 24), RightShoulder = A(-35, 0, -8), RightElbow = A(120) }) },
+			{ t = 0.17, ease = "in", pose = pose({ Root = T(0, -0.1, -0.5) * A(0, 10), Waist = A(-12, 28), Neck = A(8, -26), RightShoulder = A(88, 0, -5), RightElbow = A(8), LeftShoulder = A(25, 0, 25), LeftElbow = A(115) }) },
+			{ t = 0.26, ease = "out", pose = pose({ Root = T(0, -0.08, -0.4) * A(0, 8), Waist = A(-10, 22), Neck = A(8, -20), RightShoulder = A(80, 0, -5), RightElbow = A(14) }) },
+			{ t = 0.40, pose = pose({}) },
+		},
+	},
+	M1_2 = {
+		dur = 0.40, fadeIn = 0.05, fadeOut = 0.10,
+		keys = {
+			{ t = 0, pose = pose({}) },
+			{ t = 0.11, ease = "out", pose = pose({ Root = T(0, -0.05, 0.1) * A(0, 6), Waist = A(-4, 24), Neck = A(5, -24), LeftShoulder = A(-35, 0, 8), LeftElbow = A(120) }) },
+			{ t = 0.17, ease = "in", pose = pose({ Root = T(0, -0.1, -0.5) * A(0, -10), Waist = A(-12, -28), Neck = A(8, 26), LeftShoulder = A(88, 0, 5), LeftElbow = A(8), RightShoulder = A(25, 0, -25), RightElbow = A(115) }) },
+			{ t = 0.26, ease = "out", pose = pose({ Root = T(0, -0.08, -0.4) * A(0, -8), Waist = A(-10, -22), Neck = A(8, 20), LeftShoulder = A(80, 0, 5), LeftElbow = A(14) }) },
+			{ t = 0.40, pose = pose({}) },
+		},
+	},
+	M1_3 = {
+		dur = 0.80, fadeIn = 0.06, fadeOut = 0.14,
+		keys = {
+			{ t = 0, pose = pose({}) },
+			{ t = 0.28, ease = "out", pose = pose({ Root = T(0, 0.05, 0.1), Waist = A(18), Neck = A(-15), RightShoulder = A(165, 0, -15), LeftShoulder = A(165, 0, 15), RightElbow = A(25), LeftElbow = A(25) }) },
+			{ t = 0.38, ease = "in", pose = pose({ Root = T(0, -0.45, -0.55) * A(-8), Waist = A(-38), Neck = A(25), RightShoulder = A(55, 0, -6), LeftShoulder = A(55, 0, 6), RightElbow = A(10), LeftElbow = A(10) }) },
+			{ t = 0.50, pose = pose({ Root = T(0, -0.42, -0.5) * A(-8), Waist = A(-34), Neck = A(22), RightShoulder = A(50, 0, -6), LeftShoulder = A(50, 0, 6), RightElbow = A(12), LeftElbow = A(12) }) },
+			{ t = 0.80, pose = pose({}) },
+		},
+	},
+	Dash = {
+		dur = 0.32, fadeIn = 0.04, fadeOut = 0.12,
+		keys = {
+			{ t = 0, pose = pose({}, true) },
+			{ t = 0.08, ease = "out", pose = DASH_POSE },
+			{ t = 0.22, pose = DASH_POSE },
+			{ t = 0.32, pose = pose({}, true) },
+		},
+	},
+	Shockwave = {
+		dur = 1.05, fadeIn = 0.08, fadeOut = 0.18,
+		keys = {
+			{ t = 0, pose = pose({}, true) },
+			{ t = 0.35, ease = "out", pose = withQuakeLegs({ Root = T(0, -0.9, 0), Waist = A(-15), Neck = A(10), RightShoulder = A(160, 0, 30), LeftShoulder = A(160, 0, -30), RightElbow = A(15), LeftElbow = A(15) }) },
+			{ t = 0.47, ease = "in", pose = withQuakeLegs({ Root = T(0, -1.1, -0.2), Waist = A(-45), Neck = A(30), RightShoulder = A(35, 0, 8), LeftShoulder = A(35, 0, -8), RightElbow = A(5), LeftElbow = A(5) }) },
+			{ t = 0.80, pose = withQuakeLegs({ Root = T(0, -1.05, -0.2), Waist = A(-42), Neck = A(28), RightShoulder = A(38, 0, 8), LeftShoulder = A(38, 0, -8), RightElbow = A(8), LeftElbow = A(8) }) },
+			{ t = 1.05, pose = pose({}, true) },
+		},
+	},
+	Block = {
+		dur = 0.30, fadeIn = 0.08, fadeOut = 0.12, hold = 0.12,
+		keys = {
+			{ t = 0, pose = pose({}) },
+			{ t = 0.12, ease = "out", pose = BLOCK_POSE },
+			{ t = 0.30, pose = pose({}) },
+		},
+	},
+	Hit = {
+		dur = 0.35, fadeIn = 0.02, fadeOut = 0.12,
+		keys = {
+			{ t = 0, pose = pose({}) },
+			{ t = 0.06, ease = "out", pose = HIT_POSE },
+			{ t = 0.35, pose = pose({}) },
+		},
+	},
+}
+
+local function sample(def, t, out)
+	table.clear(out)
+	local keys = def.keys
+	local n = #keys
+	if t <= keys[1].t then
+		for j, cf in pairs(keys[1].pose) do out[j] = cf end
+		return
+	end
+	if t >= keys[n].t then
+		for j, cf in pairs(keys[n].pose) do out[j] = cf end
+		return
+	end
+	for i = 1, n - 1 do
+		local a, b = keys[i], keys[i + 1]
+		if t <= b.t then
+			local e = EASE[b.ease or "inout"]((t - a.t) / (b.t - a.t))
+			for j, cfA in pairs(a.pose) do
+				out[j] = cfA:Lerp(b.pose[j] or cfA, e)
+			end
+			return
+		end
+	end
+end
+
+----------------------------------------------------------------------
+-- RIG RUNTIME
+----------------------------------------------------------------------
+
+local Animator = {}
+local rigs = {}
+
+local function collectMotors(char)
+	local motors = {}
+	for _, d in ipairs(char:GetDescendants()) do
+		if d:IsA("Motor6D") then
+			motors[d.Name] = d
+		end
+	end
+	for _, name in ipairs(JOINTS) do
+		if not motors[name] then
+			return nil
+		end
+	end
+	return motors
+end
+
+local function attach(char)
+	task.spawn(function()
+		local hum = char:WaitForChild("Humanoid", 10)
+		local root = char:WaitForChild("HumanoidRootPart", 10)
+		if not hum or not root then
+			return
+		end
+		if hum.RigType ~= Enum.HumanoidRigType.R15 then
+			warn("[ProceduralAnimator] " .. char.Name .. " is not R15. Set Game Settings > Avatar > R15.")
+			return
+		end
+		local motors
+		for _ = 1, 50 do
+			motors = collectMotors(char)
+			if motors then
+				break
+			end
+			task.wait(0.2)
+			if not char.Parent then
+				return
+			end
+		end
+		if not motors then
+			warn("[ProceduralAnimator] Missing R15 Motor6Ds on " .. char.Name)
+			return
+		end
+
+		local rp = RaycastParams.new()
+		rp.FilterType = Enum.RaycastFilterType.Exclude
+		rp.FilterDescendantsInstances = { char }
+
+		local rig = {
+			char = char, hum = hum, root = root, motors = motors, rayParams = rp,
+			cur = {}, tg = {}, final = {}, applied = {}, actionPose = {},
+			phase = 0, grounded = true, airTime = 0, landTimer = 0, landMax = 0.3,
+			action = nil, fromPose = nil, fromT = 0,
+		}
+		for _, j in ipairs(JOINTS) do
+			rig.cur[j] = I
+			rig.tg[j] = I
+		end
+		rigs[char] = rig
+		char.AncestryChanged:Connect(function(_, parent)
+			if not parent then
+				rigs[char] = nil
+			end
+		end)
+	end)
+end
+
+local function updateRig(rig, dt, now)
+	local hum, root = rig.hum, rig.root
+	if hum.Health <= 0 or not root.Parent then
+		return
+	end
+
+	local vel = root.AssemblyLinearVelocity
+	local flatVel = Vector3.new(vel.X, 0, vel.Z)
+	local speed = flatVel.Magnitude
+	local look = root.CFrame.LookVector
+	local dirSign = 1
+	if speed > 0.5 and flatVel:Dot(Vector3.new(look.X, 0, look.Z)) < 0 then
+		dirSign = -1
+	end
+
+	local hit = Workspace:Raycast(root.Position, Vector3.new(0, -(hum.HipHeight + root.Size.Y / 2 + 1.3), 0), rig.rayParams)
+	local grounded = hit ~= nil
+	if grounded then
+		if not rig.grounded and rig.airTime > 0.3 then
+			rig.landMax = clamp(rig.airTime * 0.5, 0.2, 0.4)
+			rig.landTimer = rig.landMax
+		end
+		rig.airTime = 0
+	else
+		rig.airTime += dt
+	end
+	rig.grounded = grounded
+	rig.landTimer = max(0, rig.landTimer - dt)
+
+	-- Base locomotion target
+	local tg = rig.tg
+	if not grounded and rig.airTime > 0.12 then
+		local src = vel.Y > 1 and AIR_JUMP or AIR_FALL
+		for _, j in ipairs(JOINTS) do
+			tg[j] = src[j]
+		end
+	else
+		local a = speed > 0.5 and clamp(speed / 16, 0, 1.3) or 0
+		rig.phase += dt * speed * 0.5 * dirSign
+		local s, c = sin(rig.phase), cos(rig.phase)
+		local rb = clamp((speed - 14) / 10, 0, 1)
+		local stride = (26 + 20 * rb) * a
+		local kneeAmp = (40 + 30 * rb) * a
+		local armAmp = (32 + 20 * rb) * a
+		local lean = (2 + 9 * rb) * a
+		local br = sin(now * 2.2) * (1 - a)
+		local rk = max(0, c) * kneeAmp + 3
+		local lk = max(0, -c) * kneeAmp + 3
+		local rh, lh = s * stride, -s * stride
+
+		tg.Root = T(0, -abs(s) * (0.08 + 0.1 * rb) * a + br * 0.015, 0) * A(0, s * 4 * a, 0)
+		tg.Waist = A(-lean + br * 1.5, -s * 7 * a, 0)
+		tg.Neck = A(lean * 0.7 - br * 0.8, s * 7 * a, 0)
+		tg.RightShoulder = A(-s * armAmp + br * 2, 0, 6)
+		tg.LeftShoulder = A(s * armAmp + br * 2, 0, -6)
+		tg.RightElbow = A(10 + (18 + 30 * rb) * a + max(0, -s) * 18 * a)
+		tg.LeftElbow = A(10 + (18 + 30 * rb) * a + max(0, s) * 18 * a)
+		tg.RightWrist = I
+		tg.LeftWrist = I
+		tg.RightHip = A(rh, 0, 3 * (1 - a))
+		tg.LeftHip = A(lh, 0, -3 * (1 - a))
+		tg.RightKnee = A(-rk)
+		tg.LeftKnee = A(-lk)
+		tg.RightAnkle = A(-(rh - rk) * 0.6)
+		tg.LeftAnkle = A(-(lh - lk) * 0.6)
+	end
+
+	if rig.landTimer > 0 then
+		local w = rig.landTimer / rig.landMax
+		for _, j in ipairs(JOINTS) do
+			tg[j] = tg[j]:Lerp(LAND[j], w)
+		end
+	end
+
+	-- Smooth toward target so idle/walk/air transitions never snap
+	local alpha = 1 - exp(-dt * 16)
+	local cur, final = rig.cur, rig.final
+	for _, j in ipairs(JOINTS) do
+		cur[j] = cur[j]:Lerp(tg[j], alpha)
+		final[j] = cur[j]
+	end
+
+	-- Action overlay
+	table.clear(rig.applied)
+	local act = rig.action
+	if act then
+		local def = act.def
+		if def.hold and not act.stopping and act.t >= def.hold then
+			act.t = def.hold
+		else
+			act.t += dt
+		end
+		if act.t >= def.dur then
+			rig.action = nil
+			rig.fromPose = nil
+		else
+			local ap = rig.actionPose
+			sample(def, act.t, ap)
+			if rig.fromPose then
+				rig.fromT += dt
+				local k = EASE.inout(clamp(rig.fromT / 0.08, 0, 1))
+				for j, cf in pairs(ap) do
+					ap[j] = (rig.fromPose[j] or cur[j]):Lerp(cf, k)
+				end
+				if k >= 1 then
+					rig.fromPose = nil
+				end
+			end
+			local w = 1
+			if not act.noFadeIn then
+				w = EASE.inout(clamp(act.t / def.fadeIn, 0, 1))
+			end
+			w *= EASE.inout(clamp((def.dur - act.t) / def.fadeOut, 0, 1))
+			for j, cf in pairs(ap) do
+				final[j] = cur[j]:Lerp(cf, w)
+				rig.applied[j] = final[j]
+			end
+		end
+	end
+
+	for _, j in ipairs(JOINTS) do
+		rig.motors[j].Transform = final[j]
+	end
+end
+
+----------------------------------------------------------------------
+-- PUBLIC API
+----------------------------------------------------------------------
+
+function Animator.Play(char, name)
+	local rig = char and rigs[char]
+	local def = Actions[name]
+	if not rig or not def then
+		return
+	end
+	local from = nil
+	if rig.action and next(rig.applied) then
+		from = table.clone(rig.applied)
+	end
+	rig.fromPose = from
+	rig.fromT = 0
+	rig.action = { name = name, def = def, t = 0, stopping = false, noFadeIn = from ~= nil }
+end
+
+function Animator.Stop(char, name)
+	local rig = char and rigs[char]
+	if rig and rig.action and rig.action.name == name then
+		rig.action.stopping = true
+	end
+end
+
+local started = false
+function Animator.Start()
+	if started then
+		return
+	end
+	started = true
+
+	local function hookPlayer(player)
+		player.CharacterAdded:Connect(attach)
+		if player.Character then
+			attach(player.Character)
+		end
+	end
+	Players.PlayerAdded:Connect(hookPlayer)
+	for _, p in ipairs(Players:GetPlayers()) do
+		hookPlayer(p)
+	end
+
+	RunService.PreRender:Connect(function(dt)
+		local cam = Workspace.CurrentCamera
+		local now = os.clock()
+		for char, rig in pairs(rigs) do
+			if not char.Parent then
+				rigs[char] = nil
+			elseif not cam or (rig.root.Position - cam.CFrame.Position).Magnitude < 250 then
+				updateRig(rig, dt, now)
+			end
+		end
+	end)
+end
+
+return Animator
+]]></ProtectedString></Properties></Item></Item><Item class="ServerScriptService" referent="RBX5"><Properties><string name="Name">ServerScriptService</string></Properties><Item class="Script" referent="RBX6"><Properties><string name="Name">BattlegroundServer</string><ProtectedString name="Source"><![CDATA[-- ServerScriptService/BattlegroundServer (Script)
+-- Builds the arena + lighting, runs server-authoritative combat, stats and respawns.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
+
+local combatRemote = Instance.new("RemoteEvent")
+combatRemote.Name = Config.RemoteName
+combatRemote.Parent = ReplicatedStorage
+
+local fxRemote = Instance.new("RemoteEvent")
+fxRemote.Name = Config.FXRemoteName
+fxRemote.Parent = ReplicatedStorage
+
+----------------------------------------------------------------------
+-- MAP
+----------------------------------------------------------------------
+
+local function part(props, parent)
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	for key, value in pairs(props) do
+		p[key] = value
+	end
+	p.Parent = parent
+	return p
+end
+
+-- Vertical cylinder whose top face sits at topY.
+local function disc(parent, name, radius, topY, height, color, material)
+	return part({
+		Name = name,
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(height, radius * 2, radius * 2),
+		CFrame = CFrame.new(0, topY - height / 2, 0) * CFrame.Angles(0, 0, math.rad(90)),
+		Color = color,
+		Material = material,
+	}, parent)
+end
+
+local function buildLighting()
+	Lighting.ClockTime = 17.3
+	Lighting.Brightness = 2.4
+	Lighting.Ambient = Color3.fromRGB(72, 70, 92)
+	Lighting.OutdoorAmbient = Color3.fromRGB(90, 86, 110)
+	Lighting.EnvironmentDiffuseScale = 0.6
+	Lighting.EnvironmentSpecularScale = 0.6
+
+	for _, className in ipairs({ "Atmosphere", "BloomEffect", "ColorCorrectionEffect", "SunRaysEffect" }) do
+		local old = Lighting:FindFirstChildOfClass(className)
+		if old then
+			old:Destroy()
+		end
+	end
+
+	local atmo = Instance.new("Atmosphere")
+	atmo.Density = 0.32
+	atmo.Offset = 0.25
+	atmo.Color = Color3.fromRGB(255, 200, 160)
+	atmo.Decay = Color3.fromRGB(120, 90, 110)
+	atmo.Glare = 0.35
+	atmo.Haze = 1.6
+	atmo.Parent = Lighting
+
+	local bloom = Instance.new("BloomEffect")
+	bloom.Intensity = 0.45
+	bloom.Size = 24
+	bloom.Threshold = 1.1
+	bloom.Parent = Lighting
+
+	local cc = Instance.new("ColorCorrectionEffect")
+	cc.Contrast = 0.08
+	cc.Saturation = 0.12
+	cc.TintColor = Color3.fromRGB(255, 244, 235)
+	cc.Parent = Lighting
+
+	local rays = Instance.new("SunRaysEffect")
+	rays.Intensity = 0.12
+	rays.Spread = 0.8
+	rays.Parent = Lighting
+end
+
+local function buildArena()
+	local old = Workspace:FindFirstChild("Arena")
+	if old then
+		old:Destroy()
+	end
+	local arena = Instance.new("Folder")
+	arena.Name = "Arena"
+	arena.Parent = Workspace
+
+	local R = Config.ArenaRadius
+	local floorColor = Color3.fromRGB(64, 66, 78)
+	local innerColor = Color3.fromRGB(70, 72, 84)
+	local glowColor = Color3.fromRGB(255, 150, 60)
+
+	-- Floors
+	disc(arena, "Outskirts", 700, -3, 2, Color3.fromRGB(35, 38, 45), Enum.Material.Concrete)
+	disc(arena, "Floor", R, 0, 4, floorColor, Enum.Material.Slate)
+
+	-- Concentric glowing rings (each ring lifts the inner floor a hair)
+	local rings = { 96, 62, 32 }
+	for i, r in ipairs(rings) do
+		disc(arena, "RingGlow" .. i, r, 0.03 * (2 * i - 1), 0.03, glowColor, Enum.Material.Neon)
+		disc(arena, "RingFloor" .. i, r - 1.4, 0.03 * (2 * i), 0.03, innerColor, Enum.Material.Slate)
+	end
+
+	-- Raised centre platform (two low steps, each under 1 stud)
+	disc(arena, "PlatformLow", 24, 0.9, 0.8, Color3.fromRGB(90, 86, 84), Enum.Material.Concrete)
+	disc(arena, "PlatformHigh", 17, 1.7, 0.8, Color3.fromRGB(104, 98, 94), Enum.Material.Concrete)
+	disc(arena, "EmblemGlow", 8, 1.74, 0.04, glowColor, Enum.Material.Neon)
+	disc(arena, "EmblemCore", 6.8, 1.78, 0.04, Color3.fromRGB(30, 30, 38), Enum.Material.Slate)
+
+	-- Perimeter wall with battlements and a glowing base strip
+	local N = 36
+	local wallW = (2 * math.pi * R / N) + 0.6
+	for i = 1, N do
+		local ang = (i / N) * 2 * math.pi
+		local pos = Vector3.new(math.cos(ang) * (R + 1), 8, math.sin(ang) * (R + 1))
+		local cf = CFrame.lookAt(pos, Vector3.new(0, 8, 0))
+		part({
+			Name = "Wall" .. i,
+			Size = Vector3.new(wallW, 16, 4),
+			CFrame = cf,
+			Material = Enum.Material.Brick,
+			Color = Color3.fromRGB(88, 80, 76),
+		}, arena)
+		if i % 2 == 0 then
+			part({
+				Name = "Merlon" .. i,
+				Size = Vector3.new(wallW * 0.5, 4, 4.4),
+				CFrame = cf * CFrame.new(0, 10, 0),
+				Material = Enum.Material.Brick,
+				Color = Color3.fromRGB(78, 72, 68),
+			}, arena)
+		end
+		part({
+			Name = "WallGlow" .. i,
+			Size = Vector3.new(wallW - 1.5, 0.4, 0.3),
+			CFrame = cf * CFrame.new(0, -6.6, -2.1),
+			Material = Enum.Material.Neon,
+			Color = glowColor,
+			CanCollide = false,
+		}, arena)
+	end
+
+	-- Pillars (cover + landmarks)
+	for k = 0, 7 do
+		local ang = math.rad(k * 45 + 22.5)
+		local x, z = math.cos(ang) * 72, math.sin(ang) * 72
+		part({ Name = "PillarBase" .. k, Size = Vector3.new(7, 1.2, 7), CFrame = CFrame.new(x, 0.6, z), Material = Enum.Material.Concrete, Color = Color3.fromRGB(96, 92, 90) }, arena)
+		part({
+			Name = "PillarShaft" .. k,
+			Shape = Enum.PartType.Cylinder,
+			Size = Vector3.new(18, 4, 4),
+			CFrame = CFrame.new(x, 10.2, z) * CFrame.Angles(0, 0, math.rad(90)),
+			Material = Enum.Material.Marble,
+			Color = Color3.fromRGB(150, 146, 140),
+		}, arena)
+		part({ Name = "PillarCap" .. k, Size = Vector3.new(6, 1.2, 6), CFrame = CFrame.new(x, 19.8, z), Material = Enum.Material.Concrete, Color = Color3.fromRGB(96, 92, 90) }, arena)
+		local orb = part({
+			Name = "PillarOrb" .. k,
+			Shape = Enum.PartType.Ball,
+			Size = Vector3.new(2.4, 2.4, 2.4),
+			CFrame = CFrame.new(x, 21.6, z),
+			Material = Enum.Material.Neon,
+			Color = glowColor,
+			CanCollide = false,
+		}, arena)
+		local light = Instance.new("PointLight")
+		light.Color = glowColor
+		light.Range = 28
+		light.Brightness = 1.6
+		light.Parent = orb
+	end
+
+	-- Crates (jumpable cover)
+	for k = 0, 7 do
+		local ang = math.rad(k * 45)
+		local x, z = math.cos(ang) * 46, math.sin(ang) * 46
+		part({ Name = "Crate" .. k, Size = Vector3.new(5, 5, 5), CFrame = CFrame.new(x, 2.5, z) * CFrame.Angles(0, ang * 2, 0), Material = Enum.Material.Wood, Color = Color3.fromRGB(139, 104, 70) }, arena)
+		if k % 2 == 1 then
+			part({ Name = "CrateTop" .. k, Size = Vector3.new(3.6, 3.6, 3.6), CFrame = CFrame.new(x, 6.8, z) * CFrame.Angles(0, ang * 2 + 0.5, 0), Material = Enum.Material.Wood, Color = Color3.fromRGB(120, 90, 60) }, arena)
+		end
+	end
+
+	-- Torches along the wall
+	for k = 0, 11 do
+		local ang = math.rad(k * 30 + 15)
+		local x, z = math.cos(ang) * (R - 3), math.sin(ang) * (R - 3)
+		part({ Name = "TorchPole" .. k, Size = Vector3.new(0.6, 6, 0.6), CFrame = CFrame.new(x, 3, z), Material = Enum.Material.Metal, Color = Color3.fromRGB(40, 40, 44) }, arena)
+		local flame = part({
+			Name = "TorchFlame" .. k,
+			Shape = Enum.PartType.Ball,
+			Size = Vector3.new(1.4, 1.4, 1.4),
+			CFrame = CFrame.new(x, 6.5, z),
+			Material = Enum.Material.Neon,
+			Color = Color3.fromRGB(255, 140, 40),
+			CanCollide = false,
+		}, arena)
+		local fire = Instance.new("Fire")
+		fire.Size = 5
+		fire.Heat = 8
+		fire.Parent = flame
+		local light = Instance.new("PointLight")
+		light.Color = Color3.fromRGB(255, 150, 70)
+		light.Range = 22
+		light.Brightness = 1.4
+		light.Parent = flame
+	end
+
+	-- Spawns around the rim, facing the centre
+	for k = 0, 7 do
+		local ang = math.rad(k * 45 + 22.5)
+		local x, z = math.cos(ang) * 100, math.sin(ang) * 100
+		local sp = Instance.new("SpawnLocation")
+		sp.Name = "Spawn" .. k
+		sp.Anchored = true
+		sp.Neutral = true
+		sp.Duration = 3
+		sp.Size = Vector3.new(8, 0.4, 8)
+		sp.CFrame = CFrame.lookAt(Vector3.new(x, 0.2, z), Vector3.new(0, 0.2, 0))
+		sp.Color = Color3.fromRGB(60, 190, 200)
+		sp.Material = Enum.Material.SmoothPlastic
+		sp.TopSurface = Enum.SurfaceType.Smooth
+		sp.Parent = arena
+	end
+
+	-- Void kill plane
+	local kill = part({
+		Name = "KillPlane",
+		Size = Vector3.new(2000, 4, 2000),
+		Position = Vector3.new(0, -60, 0),
+		Transparency = 1,
+		CanCollide = false,
+	}, arena)
+	kill.Touched:Connect(function(hit)
+		local hum = hit.Parent and hit.Parent:FindFirstChildOfClass("Humanoid")
+		if hum and hum.Health > 0 then
+			hum.Health = 0
+		end
+	end)
+end
+
+----------------------------------------------------------------------
+-- COMBAT STATE
+----------------------------------------------------------------------
+
+local states = {}
+
+local function newState()
+	return {
+		combo = 0,
+		lastM1 = 0,
+		nextM1 = 0,
+		nextDash = 0,
+		nextAbility = 0,
+		lockUntil = 0, -- dash / ability animation lock
+		stunUntil = 0,
+		slowUntil = 0,
+		iframeUntil = 0,
+		blocking = false,
+		swingId = 0, -- bumped to cancel pending hits
+		lastRequest = 0,
+		lastAttacker = nil,
+		lastHitTime = 0,
+	}
+end
+
+local function getAlive(player)
+	local char = player.Character
+	if not char then
+		return nil
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not hum or hum.Health <= 0 or not root or not root:IsA("BasePart") then
+		return nil
+	end
+	return char, hum, root
+end
+
+local function flatten(v)
+	local f = Vector3.new(v.X, 0, v.Z)
+	if f.Magnitude < 0.001 then
+		return Vector3.zero
+	end
+	return f.Unit
+end
+
+local function refreshSpeed(player)
+	local _, hum = getAlive(player)
+	local st = states[player]
+	if not hum or not st then
+		return
+	end
+	local now = os.clock()
+	if now < st.stunUntil then
+		hum.WalkSpeed = Config.StunSpeed
+	elseif st.blocking then
+		hum.WalkSpeed = Config.BlockSpeed
+	elseif now < st.slowUntil or now < st.lockUntil then
+		hum.WalkSpeed = Config.ActionSpeed
+	else
+		hum.WalkSpeed = Config.WalkSpeed
+	end
+end
+
+local function inCone(aRoot, tRoot, range, minDot)
+	local offset = tRoot.Position - aRoot.Position
+	if math.abs(offset.Y) > 6 then
+		return false
+	end
+	local flat = Vector3.new(offset.X, 0, offset.Z)
+	local dist = flat.Magnitude
+	if dist > range then
+		return false
+	end
+	if dist < 0.5 then
+		return true
+	end
+	local look = flatten(aRoot.CFrame.LookVector)
+	return flat.Unit:Dot(look) >= minDot
+end
+
+local function dealDamage(attacker, aRoot, victim, amount, kbForce, stun)
+	local vChar, vHum, vRoot = getAlive(victim)
+	local vs = states[victim]
+	if not vChar or not vs then
+		return
+	end
+	local now = os.clock()
+	if now < vs.iframeUntil or vChar:FindFirstChildOfClass("ForceField") then
+		return
+	end
+
+	local away = flatten(vRoot.Position - aRoot.Position)
+	local blocked = false
+	if vs.blocking then
+		local vLook = flatten(vRoot.CFrame.LookVector)
+		blocked = vLook:Dot(-away) > 0 -- attacker is in front of the guard
+	end
+
+	if blocked then
+		amount *= Config.Block.DamageMultiplier
+		kbForce *= Config.Block.KnockbackMultiplier
+		stun = 0
+	else
+		vs.swingId += 1 -- interrupt anything the victim was winding up
+		vs.lockUntil = 0
+		vs.stunUntil = now + stun
+		if vs.blocking then
+			vs.blocking = false -- guard broken (hit from behind)
+			fxRemote:FireAllClients("BlockEnd", victim)
+		end
+		task.delay(stun + 0.03, refreshSpeed, victim)
+	end
+
+	vs.lastAttacker = attacker
+	vs.lastHitTime = now
+	vHum:TakeDamage(amount)
+	fxRemote:FireAllClients("Hit", victim, attacker, away, amount, blocked)
+	if kbForce > 0 then
+		fxRemote:FireClient(victim, "Knockback", away * kbForce + Vector3.new(0, kbForce * 0.3, 0))
+	end
+	refreshSpeed(victim)
+end
+
+local function ready(st, now)
+	return now >= st.stunUntil and now >= st.lockUntil
+end
+
+local handlers = {}
+
+handlers.M1 = function(player, st, now)
+	local _, _, root = getAlive(player)
+	if not root or st.blocking or now < st.nextM1 or not ready(st, now) then
+		return
+	end
+	if now - st.lastM1 > Config.M1.ComboWindow then
+		st.combo = 0
+	end
+	st.combo = st.combo % 3 + 1
+	local idx = st.combo
+	st.lastM1 = now
+	st.nextM1 = now + Config.M1.Cooldowns[idx]
+	st.slowUntil = st.nextM1
+	st.swingId += 1
+	local swingId = st.swingId
+
+	fxRemote:FireAllClients("M1", player, idx)
+	refreshSpeed(player)
+	task.delay(Config.M1.Cooldowns[idx] + 0.02, refreshSpeed, player)
+
+	task.delay(Config.M1.HitDelay[idx], function()
+		if st.swingId ~= swingId then
+			return
+		end
+		local _, _, aRoot = getAlive(player)
+		if not aRoot then
+			return
+		end
+		for _, other in ipairs(Players:GetPlayers()) do
+			if other ~= player then
+				local oChar, _, oRoot = getAlive(other)
+				if oChar and inCone(aRoot, oRoot, Config.M1.Range, Config.M1.MinDot) then
+					dealDamage(player, aRoot, other, Config.M1.Damage[idx], Config.M1.Knockback[idx], Config.M1.Stun[idx])
+				end
+			end
+		end
+	end)
+end
+
+handlers.Dash = function(player, st, now)
+	local _, _, root = getAlive(player)
+	if not root or now < st.nextDash or not ready(st, now) then
+		return
+	end
+	if st.blocking then
+		st.blocking = false
+		fxRemote:FireAllClients("BlockEnd", player)
+	end
+	st.nextDash = now + Config.Dash.Cooldown
+	st.iframeUntil = now + Config.Dash.IFrames
+	st.lockUntil = now + Config.Dash.Duration + 0.1
+	st.swingId += 1
+	fxRemote:FireAllClients("Dash", player)
+	refreshSpeed(player)
+	task.delay(Config.Dash.Duration + 0.12, refreshSpeed, player)
+end
+
+handlers.Shockwave = function(player, st, now)
+	local _, _, root = getAlive(player)
+	if not root or now < st.nextAbility or not ready(st, now) then
+		return
+	end
+	if st.blocking then
+		st.blocking = false
+		fxRemote:FireAllClients("BlockEnd", player)
+	end
+	local cfg = Config.Shockwave
+	st.nextAbility = now + cfg.Cooldown
+	st.lockUntil = now + cfg.LockTime
+	st.swingId += 1
+	local swingId = st.swingId
+	fxRemote:FireAllClients("Shockwave", player)
+	refreshSpeed(player)
+	task.delay(cfg.LockTime + 0.02, refreshSpeed, player)
+
+	task.delay(cfg.HitDelay, function()
+		if st.swingId ~= swingId then
+			return
+		end
+		local _, _, aRoot = getAlive(player)
+		if not aRoot then
+			return
+		end
+		for _, other in ipairs(Players:GetPlayers()) do
+			if other ~= player then
+				local oChar, _, oRoot = getAlive(other)
+				if oChar then
+					local offset = oRoot.Position - aRoot.Position
+					local flatDist = Vector3.new(offset.X, 0, offset.Z).Magnitude
+					if flatDist <= cfg.Radius and math.abs(offset.Y) < 8 then
+						dealDamage(player, aRoot, other, cfg.Damage, cfg.Knockback, cfg.Stun)
+					end
+				end
+			end
+		end
+	end)
+end
+
+handlers.BlockStart = function(player, st, now)
+	local _, _, root = getAlive(player)
+	if not root or st.blocking or not ready(st, now) then
+		return
+	end
+	st.blocking = true
+	fxRemote:FireAllClients("BlockStart", player)
+	refreshSpeed(player)
+end
+
+handlers.BlockEnd = function(player, st, _now)
+	if not st.blocking then
+		return
+	end
+	st.blocking = false
+	fxRemote:FireAllClients("BlockEnd", player)
+	refreshSpeed(player)
+end
+
+combatRemote.OnServerEvent:Connect(function(player, action)
+	if typeof(action) ~= "string" then
+		return
+	end
+	local handler = handlers[action]
+	local st = states[player]
+	if not handler or not st then
+		return
+	end
+	local now = os.clock()
+	if action ~= "BlockEnd" then
+		if now - st.lastRequest < Config.MinRequestInterval then
+			return
+		end
+		st.lastRequest = now
+	end
+	handler(player, st, now)
+end)
+
+----------------------------------------------------------------------
+-- PLAYERS / STATS
+----------------------------------------------------------------------
+
+local function onCharacterAdded(player, char)
+	states[player] = newState()
+	local hum = char:WaitForChild("Humanoid", 10)
+	if not hum then
+		return
+	end
+	hum.WalkSpeed = Config.WalkSpeed
+	hum.Died:Connect(function()
+		local st = states[player]
+		local stats = player:FindFirstChild("leaderstats")
+		if stats and stats:FindFirstChild("Deaths") then
+			stats.Deaths.Value += 1
+		end
+		local killerName
+		if st and st.lastAttacker and st.lastAttacker ~= player and st.lastAttacker.Parent == Players then
+			if os.clock() - st.lastHitTime <= Config.AssistWindow then
+				local kStats = st.lastAttacker:FindFirstChild("leaderstats")
+				if kStats and kStats:FindFirstChild("Kills") then
+					kStats.Kills.Value += 1
+				end
+				killerName = st.lastAttacker.Name
+			end
+		end
+		fxRemote:FireAllClients("Kill", killerName or "", player.Name)
+	end)
+end
+
+local function onPlayerAdded(player)
+	states[player] = newState()
+
+	local stats = Instance.new("Folder")
+	stats.Name = "leaderstats"
+	local kills = Instance.new("IntValue")
+	kills.Name = "Kills"
+	kills.Parent = stats
+	local deaths = Instance.new("IntValue")
+	deaths.Name = "Deaths"
+	deaths.Parent = stats
+	stats.Parent = player
+
+	player.CharacterAdded:Connect(function(char)
+		onCharacterAdded(player, char)
+	end)
+	if player.Character then
+		task.spawn(onCharacterAdded, player, player.Character)
+	end
+end
+
+Players.RespawnTime = Config.RespawnTime
+buildLighting()
+buildArena()
+
+Players.PlayerAdded:Connect(onPlayerAdded)
+Players.PlayerRemoving:Connect(function(player)
+	states[player] = nil
+end)
+for _, player in ipairs(Players:GetPlayers()) do
+	task.spawn(onPlayerAdded, player)
+end
+]]></ProtectedString></Properties></Item></Item><Item class="StarterPlayer" referent="RBX7"><Properties><string name="Name">StarterPlayer</string></Properties><Item class="StarterPlayerScripts" referent="RBX8"><Properties><string name="Name">StarterPlayerScripts</string></Properties><Item class="LocalScript" referent="RBX9"><Properties><string name="Name">BattlegroundClient</string><ProtectedString name="Source"><![CDATA[-- StarterPlayer/StarterPlayerScripts/BattlegroundClient (LocalScript)
+-- HUD, input, combat requests, and visual effects. The server is authoritative;
+-- this script only requests actions and renders what the server broadcasts.
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local ContextActionService = game:GetService("ContextActionService")
+local StarterGui = game:GetService("StarterGui")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+
+local Config = require(ReplicatedStorage:WaitForChild("Config"))
+local Animator = require(ReplicatedStorage:WaitForChild("ProceduralAnimator"))
+local combatRemote = ReplicatedStorage:WaitForChild(Config.RemoteName)
+local fxRemote = ReplicatedStorage:WaitForChild(Config.FXRemoteName)
+
+local localPlayer = Players.LocalPlayer
+local isTouch = UserInputService.TouchEnabled
+
+Animator.Start()
+
+task.spawn(function()
+	for _ = 1, 10 do
+		if pcall(StarterGui.SetCoreGuiEnabled, StarterGui, Enum.CoreGuiType.Health, false) then
+			return
+		end
+		task.wait(0.5)
+	end
+	warn("[BattlegroundClient] Could not hide the default health bar.")
+end)
+
+----------------------------------------------------------------------
+-- UI HELPERS
+----------------------------------------------------------------------
+
+local ACCENT = Color3.fromRGB(255, 165, 60)
+local PANEL = Color3.fromRGB(16, 18, 26)
+
+local function make(class, props, parent)
+	local inst = Instance.new(class)
+	for k, v in pairs(props) do
+		inst[k] = v
+	end
+	inst.Parent = parent
+	return inst
+end
+
+local function corner(parent, r)
+	return make("UICorner", { CornerRadius = UDim.new(0, r) }, parent)
+end
+
+local gui = make("ScreenGui", {
+	Name = "BattlegroundUI",
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	DisplayOrder = 5,
+}, localPlayer:WaitForChild("PlayerGui"))
+
+local uiScale = make("UIScale", {}, gui)
+local function updateScale()
+	local cam = Workspace.CurrentCamera
+	if cam then
+		uiScale.Scale = math.clamp(cam.ViewportSize.Y / 860, 0.65, 1.25)
+	end
+end
+updateScale()
+if Workspace.CurrentCamera then
+	Workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateScale)
+end
+
+----------------------------------------------------------------------
+-- HEALTH BAR
+----------------------------------------------------------------------
+
+local hpFrame = make("Frame", {
+	Name = "Health",
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -20),
+	Size = UDim2.fromOffset(360, 26),
+	BackgroundColor3 = PANEL,
+	BorderSizePixel = 0,
+}, gui)
+corner(hpFrame, 8)
+make("UIStroke", { Color = Color3.new(1, 1, 1), Transparency = 0.75, Thickness = 1.5 }, hpFrame)
+
+local hpTrail = make("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 0.45, BorderSizePixel = 0 }, hpFrame)
+corner(hpTrail, 8)
+local hpFill = make("Frame", { Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(90, 220, 120), BorderSizePixel = 0, ZIndex = 2 }, hpFrame)
+corner(hpFill, 8)
+local hpText = make("TextLabel", {
+	Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 3,
+	Font = Enum.Font.GothamBold, TextSize = 15, TextColor3 = Color3.new(1, 1, 1),
+	TextStrokeTransparency = 0.6, Text = "100",
+}, hpFrame)
+
+----------------------------------------------------------------------
+-- ABILITY SLOTS (double as touch buttons)
+----------------------------------------------------------------------
+
+local slotRow = make("Frame", {
+	Name = "Slots",
+	AnchorPoint = Vector2.new(0.5, 1),
+	Position = UDim2.new(0.5, 0, 1, -56),
+	Size = UDim2.fromOffset(4 * 70 + 3 * 10, 70),
+	BackgroundTransparency = 1,
+}, gui)
+make("UIListLayout", { FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 10), HorizontalAlignment = Enum.HorizontalAlignment.Center }, slotRow)
+
+local SLOT_DEFS = {
+	{ id = "M1", label = "STRIKE", key = "LMB" },
+	{ id = "Dash", label = "DASH", key = "Q" },
+	{ id = "Block", label = "GUARD", key = "F" },
+	{ id = "Shockwave", label = "QUAKE", key = "E" },
+}
+local slots = {}
+
+for order, def in ipairs(SLOT_DEFS) do
+	local btn = make("TextButton", {
+		Name = def.id, LayoutOrder = order, Size = UDim2.fromOffset(70, 70),
+		BackgroundColor3 = PANEL, BackgroundTransparency = 0.1, AutoButtonColor = false,
+		Text = "", ClipsDescendants = true, BorderSizePixel = 0,
+	}, slotRow)
+	corner(btn, 12)
+	local stroke = make("UIStroke", { Color = ACCENT, Transparency = 0.45, Thickness = 2 }, btn)
+	make("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 22), Position = UDim2.fromOffset(0, 8), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBlack, TextSize = 20, TextColor3 = Color3.new(1, 1, 1),
+		Text = isTouch and string.sub(def.label, 1, 1) or def.key,
+	}, btn)
+	make("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 14), Position = UDim2.new(0, 0, 1, -20), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = Color3.fromRGB(200, 200, 210), Text = def.label,
+	}, btn)
+	local cover = make("Frame", {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.fromScale(1, 0),
+		BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.3, BorderSizePixel = 0, ZIndex = 3,
+	}, btn)
+	local timeText = make("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, ZIndex = 4,
+		Font = Enum.Font.GothamBlack, TextSize = 20, TextColor3 = Color3.new(1, 1, 1), Text = "",
+	}, btn)
+	slots[def.id] = { button = btn, stroke = stroke, cover = cover, timeText = timeText, readyAt = 0, total = 1 }
+end
+
+local function setCooldown(id, seconds)
+	local s = slots[id]
+	s.readyAt = os.clock() + seconds
+	s.total = math.max(seconds, 0.01)
+end
+
+local function isReady(id)
+	return os.clock() >= slots[id].readyAt
+end
+
+----------------------------------------------------------------------
+-- OTHER HUD
+----------------------------------------------------------------------
+
+local statsLabel = make("TextLabel", {
+	Position = UDim2.fromOffset(16, 12), Size = UDim2.fromOffset(260, 28), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold, TextSize = 18, TextColor3 = Color3.new(1, 1, 1),
+	TextStrokeTransparency = 0.5, TextXAlignment = Enum.TextXAlignment.Left, Text = "KILLS 0   DEATHS 0",
+}, gui)
+
+local feed = make("Frame", {
+	AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -16, 0, 60), Size = UDim2.fromOffset(320, 200), BackgroundTransparency = 1,
+}, gui)
+make("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4), HorizontalAlignment = Enum.HorizontalAlignment.Right }, feed)
+local feedOrder = 0
+
+local function addFeed(text, color)
+	feedOrder += 1
+	local label = make("TextLabel", {
+		LayoutOrder = feedOrder, Size = UDim2.fromOffset(320, 24), BackgroundColor3 = PANEL, BackgroundTransparency = 0.25,
+		Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = color, Text = text, BorderSizePixel = 0,
+	}, feed)
+	corner(label, 6)
+	task.delay(5, function()
+		if label.Parent then
+			TweenService:Create(label, TweenInfo.new(0.4), { BackgroundTransparency = 1, TextTransparency = 1 }):Play()
+			Debris:AddItem(label, 0.5)
+		end
+	end)
+end
+
+local flashFrame = make("Frame", {
+	Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(200, 20, 20), BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 20, Active = false,
+}, gui)
+
+local function flashScreen(strength)
+	flashFrame.BackgroundTransparency = 1 - strength * 0.5
+	TweenService:Create(flashFrame, TweenInfo.new(0.35), { BackgroundTransparency = 1 }):Play()
+end
+
+local hitMark = make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(60, 60),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 44, Text = "X",
+	TextColor3 = Color3.new(1, 1, 1), TextTransparency = 1, TextStrokeTransparency = 1,
+}, gui)
+
+local comboLabel = make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.62), Size = UDim2.fromOffset(300, 50),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 34, TextColor3 = ACCENT,
+	TextStrokeTransparency = 0.4, Text = "", Visible = false,
+}, gui)
+
+local comboCount, lastComboHit = 0, 0
+local function registerCombo()
+	local now = os.clock()
+	comboCount = (now - lastComboHit <= 2) and comboCount + 1 or 1
+	lastComboHit = now
+	hitMark.TextTransparency = 0
+	hitMark.TextStrokeTransparency = 0.3
+	hitMark.Size = UDim2.fromOffset(80, 80)
+	TweenService:Create(hitMark, TweenInfo.new(0.25), { TextTransparency = 1, TextStrokeTransparency = 1, Size = UDim2.fromOffset(60, 60) }):Play()
+	if comboCount >= 2 then
+		comboLabel.Visible = true
+		comboLabel.Text = comboCount .. " HIT COMBO"
+	end
+end
+
+local deathLabel = make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.4), Size = UDim2.fromOffset(500, 120),
+	BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 44, TextColor3 = Color3.fromRGB(255, 80, 80),
+	TextStrokeTransparency = 0.3, Text = "ELIMINATED", Visible = false, ZIndex = 10,
+}, gui)
+
+if not isTouch then
+	make("TextLabel", {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 16, 1, -14), Size = UDim2.fromOffset(300, 20), BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham, TextSize = 13, TextColor3 = Color3.fromRGB(190, 190, 200), TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "LMB strike  |  Q dash  |  hold F guard  |  E quake",
+	}, gui)
+end
+
+-- Intro overlay
+local intro = make("CanvasGroup", { Name = "Intro", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Color3.fromRGB(10, 11, 16), BackgroundTransparency = 0.12, ZIndex = 50, BorderSizePixel = 0 }, gui)
+make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.28), Size = UDim2.fromOffset(700, 90), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack, TextSize = 66, TextColor3 = ACCENT, Text = "BATTLEGROUND",
+}, intro)
+make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.38), Size = UDim2.fromOffset(600, 30), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium, TextSize = 20, TextColor3 = Color3.fromRGB(220, 220, 230), Text = "Last one standing owns the arena.",
+}, intro)
+make("TextLabel", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.54), Size = UDim2.fromOffset(520, 130), BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium, TextSize = 18, TextColor3 = Color3.fromRGB(200, 200, 212), TextYAlignment = Enum.TextYAlignment.Top,
+	Text = isTouch and "Tap the STRIKE / DASH / GUARD / QUAKE buttons.\nHold GUARD to block hits from the front.\nCombo three strikes for a heavy finisher."
+		or "LMB  -  Strike (3-hit combo, heavy finisher)\nQ  -  Dash (brief invulnerability)\nHold F  -  Guard (blocks hits from the front)\nE  -  Quake (area slam)",
+}, intro)
+local enterBtn = make("TextButton", {
+	AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.78), Size = UDim2.fromOffset(240, 56),
+	BackgroundColor3 = ACCENT, Font = Enum.Font.GothamBlack, TextSize = 22, TextColor3 = Color3.fromRGB(20, 20, 24), Text = "ENTER ARENA", AutoButtonColor = true,
+}, intro)
+corner(enterBtn, 12)
+enterBtn.Activated:Connect(function()
+	enterBtn.Active = false
+	local tween = TweenService:Create(intro, TweenInfo.new(0.5), { GroupTransparency = 1 })
+	tween:Play()
+	tween.Completed:Connect(function()
+		intro:Destroy()
+	end)
+end)
+
+----------------------------------------------------------------------
+-- PER-FRAME UI + CAMERA SHAKE
+----------------------------------------------------------------------
+
+local shakeMag, shakeEnd, shakeDur = 0, 0, 0.1
+local function shake(mag, dur)
+	shakeMag = math.max(shakeMag, mag)
+	shakeEnd = os.clock() + dur
+	shakeDur = dur
+end
+
+RunService.RenderStepped:Connect(function()
+	local now = os.clock()
+	for _, s in pairs(slots) do
+		local remain = s.readyAt - now
+		if remain > 0 then
+			s.cover.Size = UDim2.fromScale(1, math.clamp(remain / s.total, 0, 1))
+			s.timeText.Text = string.format("%.1f", remain)
+		else
+			s.cover.Size = UDim2.fromScale(1, 0)
+			s.timeText.Text = ""
+		end
+	end
+	if comboLabel.Visible and now - lastComboHit > 2 then
+		comboLabel.Visible = false
+		comboCount = 0
+	end
+	local char = localPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if hum then
+		if now < shakeEnd then
+			local k = (shakeEnd - now) / shakeDur
+			hum.CameraOffset = Vector3.new((math.random() - 0.5) * shakeMag * k, (math.random() - 0.5) * shakeMag * k, 0)
+		else
+			shakeMag = 0
+			hum.CameraOffset = Vector3.zero
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- CHARACTER / STATS BINDING
+----------------------------------------------------------------------
+
+local localBlocking = false
+
+local function bindCharacter(char)
+	local hum = char:WaitForChild("Humanoid")
+	deathLabel.Visible = false
+	localBlocking = false
+	slots.Block.stroke.Transparency = 0.45
+
+	local function refresh()
+		local frac = math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+		hpFill.BackgroundColor3 = Color3.fromRGB(235, 70, 70):Lerp(Color3.fromRGB(90, 220, 120), frac)
+		TweenService:Create(hpFill, TweenInfo.new(0.12), { Size = UDim2.fromScale(frac, 1) }):Play()
+		TweenService:Create(hpTrail, TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out, 0, false, 0.25), { Size = UDim2.fromScale(frac, 1) }):Play()
+		hpText.Text = tostring(math.ceil(hum.Health))
+	end
+	hum.HealthChanged:Connect(refresh)
+	refresh()
+	hum.Died:Connect(function()
+		deathLabel.Text = "ELIMINATED"
+		deathLabel.Visible = true
+	end)
+end
+
+localPlayer.CharacterAdded:Connect(bindCharacter)
+if localPlayer.Character then
+	task.spawn(bindCharacter, localPlayer.Character)
+end
+
+task.spawn(function()
+	local stats = localPlayer:WaitForChild("leaderstats")
+	local kills, deaths = stats:WaitForChild("Kills"), stats:WaitForChild("Deaths")
+	local function refresh()
+		statsLabel.Text = string.format("KILLS %d   DEATHS %d", kills.Value, deaths.Value)
+	end
+	kills.Changed:Connect(refresh)
+	deaths.Changed:Connect(refresh)
+	refresh()
+end)
+
+----------------------------------------------------------------------
+-- VISUAL EFFECT HELPERS
+----------------------------------------------------------------------
+
+local function playSound(name, parent)
+	local id = Config.Sounds[name]
+	if not id or id == "" then
+		return
+	end
+	local s = Instance.new("Sound")
+	s.SoundId = id
+	s.Volume = 0.8
+	s.RollOffMaxDistance = 80
+	s.Parent = parent
+	s:Play()
+	Debris:AddItem(s, 4)
+end
+
+local function burst(pos, color, count)
+	local anchor = make("Part", {
+		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+		Transparency = 1, Size = Vector3.new(0.2, 0.2, 0.2), Position = pos,
+	}, Workspace)
+	local pe = make("ParticleEmitter", {
+		Rate = 0, Speed = NumberRange.new(14, 26), Lifetime = NumberRange.new(0.25, 0.4),
+		SpreadAngle = Vector2.new(180, 180), Color = ColorSequence.new(color), LightEmission = 1,
+		Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.6), NumberSequenceKeypoint.new(1, 0) }),
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0), NumberSequenceKeypoint.new(1, 1) }),
+	}, anchor)
+	pe:Emit(count)
+	Debris:AddItem(anchor, 1)
+end
+
+local function damageNumber(pos, amount, blocked)
+	local anchor = make("Part", {
+		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, Transparency = 1,
+		Size = Vector3.new(0.2, 0.2, 0.2),
+		Position = pos + Vector3.new(math.random(-10, 10) / 10, 1.5, math.random(-10, 10) / 10),
+	}, Workspace)
+	local bb = make("BillboardGui", { Size = UDim2.fromOffset(120, 40), AlwaysOnTop = true }, anchor)
+	local label = make("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 26,
+		Text = tostring(math.max(1, math.round(amount))), TextStrokeTransparency = 0.4,
+		TextColor3 = blocked and Color3.fromRGB(130, 200, 255) or Color3.fromRGB(255, 220, 110),
+	}, bb)
+	TweenService:Create(bb, TweenInfo.new(0.7, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { StudsOffset = Vector3.new(0, 3, 0) }):Play()
+	TweenService:Create(label, TweenInfo.new(0.7), { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+	Debris:AddItem(anchor, 0.8)
+end
+
+local function handTrail(char, handName, color)
+	local hand = char and char:FindFirstChild(handName)
+	if not hand then
+		return
+	end
+	local a0 = make("Attachment", { Position = Vector3.new(0, 0.35, 0) }, hand)
+	local a1 = make("Attachment", { Position = Vector3.new(0, -0.35, 0) }, hand)
+	make("Trail", {
+		Attachment0 = a0, Attachment1 = a1, Lifetime = 0.2, LightEmission = 1, Color = ColorSequence.new(color),
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.1), NumberSequenceKeypoint.new(1, 1) }),
+	}, a0)
+	Debris:AddItem(a0, 0.5)
+	Debris:AddItem(a1, 0.5)
+end
+
+local function groundPoint(root)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = { root.Parent }
+	local hit = Workspace:Raycast(root.Position, Vector3.new(0, -10, 0), params)
+	return hit and hit.Position + Vector3.new(0, 0.2, 0) or root.Position - Vector3.new(0, 3, 0)
+end
+
+local function shockRing(pos, radius)
+	local ring = make("Part", {
+		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+		Shape = Enum.PartType.Cylinder, Size = Vector3.new(0.5, 2, 2),
+		CFrame = CFrame.new(pos) * CFrame.Angles(0, 0, math.rad(90)),
+		Material = Enum.Material.Neon, Color = ACCENT, Transparency = 0.1,
+	}, Workspace)
+	TweenService:Create(ring, TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+		Size = Vector3.new(0.5, radius * 2, radius * 2), Transparency = 1,
+	}):Play()
+	Debris:AddItem(ring, 0.6)
+	burst(pos + Vector3.new(0, 1, 0), Color3.fromRGB(255, 200, 120), 30)
+end
+
+local function characterRoot(player)
+	local char = player.Character
+	return char, char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local guardHighlights = {}
+
+----------------------------------------------------------------------
+-- SERVER FX EVENTS
+----------------------------------------------------------------------
+
+local handlers = {}
+
+handlers.M1 = function(player, idx)
+	local char, root = characterRoot(player)
+	if not char then
+		return
+	end
+	Animator.Play(char, "M1_" .. idx)
+	local color = Color3.fromRGB(255, 225, 170)
+	if idx == 1 then
+		handTrail(char, "RightHand", color)
+	elseif idx == 2 then
+		handTrail(char, "LeftHand", color)
+	else
+		handTrail(char, "RightHand", ACCENT)
+		handTrail(char, "LeftHand", ACCENT)
+	end
+	if root then
+		playSound("M1", root)
+	end
+end
+
+handlers.Dash = function(player)
+	local char, root = characterRoot(player)
+	if not char or not root then
+		return
+	end
+	Animator.Play(char, "Dash")
+	playSound("Dash", root)
+
+	local a0 = make("Attachment", { Position = Vector3.new(0, 1.2, 0) }, root)
+	local a1 = make("Attachment", { Position = Vector3.new(0, -1.4, 0) }, root)
+	make("Trail", {
+		Attachment0 = a0, Attachment1 = a1, Lifetime = 0.3, LightEmission = 1, Color = ColorSequence.new(Color3.fromRGB(150, 220, 255)),
+		Transparency = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.2), NumberSequenceKeypoint.new(1, 1) }),
+	}, a0)
+	Debris:AddItem(a0, 0.7)
+	Debris:AddItem(a1, 0.7)
+
+	if player == localPlayer then
+		setCooldown("Dash", Config.Dash.Cooldown)
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local dir = hum and hum.MoveDirection or Vector3.zero
+		if dir.Magnitude < 0.1 then
+			dir = root.CFrame.LookVector
+		end
+		dir = Vector3.new(dir.X, 0, dir.Z).Unit
+		local att = make("Attachment", {}, root)
+		local lv = make("LinearVelocity", {
+			Attachment0 = att, VelocityConstraintMode = Enum.VelocityConstraintMode.Vector,
+			VectorVelocity = dir * Config.Dash.Speed, ForceLimitMode = Enum.ForceLimitMode.Magnitude, MaxForce = 1e6,
+			RelativeTo = Enum.ActuatorRelativeTo.World,
+		}, root)
+		Debris:AddItem(att, Config.Dash.Duration)
+		Debris:AddItem(lv, Config.Dash.Duration)
+	end
+end
+
+handlers.Shockwave = function(player)
+	local char, root = characterRoot(player)
+	if not char or not root then
+		return
+	end
+	Animator.Play(char, "Shockwave")
+	if player == localPlayer then
+		setCooldown("Shockwave", Config.Shockwave.Cooldown)
+	end
+	task.delay(Config.Shockwave.HitDelay, function()
+		local c2, r2 = characterRoot(player)
+		if not c2 or not r2 then
+			return
+		end
+		shockRing(groundPoint(r2), Config.Shockwave.Radius)
+		playSound("Shockwave", r2)
+		local cam = Workspace.CurrentCamera
+		if cam and (cam.CFrame.Position - r2.Position).Magnitude < 70 then
+			shake(0.6, 0.35)
+		end
+	end)
+end
+
+handlers.BlockStart = function(player)
+	local char = player.Character
+	if not char then
+		return
+	end
+	Animator.Play(char, "Block")
+	if guardHighlights[player] then
+		guardHighlights[player]:Destroy()
+	end
+	guardHighlights[player] = make("Highlight", {
+		FillColor = Color3.fromRGB(120, 200, 255), FillTransparency = 0.85,
+		OutlineColor = Color3.fromRGB(160, 220, 255), OutlineTransparency = 0.2,
+	}, char)
+end
+
+handlers.BlockEnd = function(player)
+	Animator.Stop(player.Character, "Block")
+	local h = guardHighlights[player]
+	if h then
+		h:Destroy()
+		guardHighlights[player] = nil
+	end
+	if player == localPlayer then
+		localBlocking = false
+		slots.Block.stroke.Transparency = 0.45
+	end
+end
+
+handlers.Hit = function(victim, attacker, _away, amount, blocked)
+	local vChar, vRoot = characterRoot(victim)
+	if not vRoot then
+		return
+	end
+	local pos = vRoot.Position + Vector3.new(0, 0.5, 0)
+	if blocked then
+		burst(pos, Color3.fromRGB(120, 200, 255), 10)
+		playSound("Block", vRoot)
+	else
+		burst(pos, Color3.fromRGB(255, 190, 90), 18)
+		Animator.Play(vChar, "Hit")
+		playSound("Hit", vRoot)
+	end
+	damageNumber(pos, amount, blocked)
+	if victim == localPlayer then
+		flashScreen(blocked and 0.3 or 0.8)
+		shake(blocked and 0.15 or 0.4, 0.2)
+	end
+	if attacker == localPlayer then
+		registerCombo()
+	end
+end
+
+handlers.Knockback = function(vec)
+	local _, root = characterRoot(localPlayer)
+	if root then
+		root.AssemblyLinearVelocity = vec
+	end
+end
+
+handlers.Kill = function(killerName, victimName)
+	if killerName ~= "" then
+		addFeed(killerName .. "  eliminated  " .. victimName, Color3.fromRGB(255, 220, 160))
+	else
+		addFeed(victimName .. "  fell", Color3.fromRGB(200, 200, 210))
+	end
+	if victimName == localPlayer.Name then
+		deathLabel.Text = killerName ~= "" and ("ELIMINATED BY " .. string.upper(killerName)) or "ELIMINATED"
+		deathLabel.Visible = true
+	end
+end
+
+fxRemote.OnClientEvent:Connect(function(kind, ...)
+	local handler = handlers[kind]
+	if handler then
+		handler(...)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	guardHighlights[player] = nil
+end)
+
+----------------------------------------------------------------------
+-- INPUT
+----------------------------------------------------------------------
+
+local function alive()
+	local char = localPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	return hum ~= nil and hum.Health > 0
+end
+
+local lastM1Send = 0
+local actions = {}
+
+function actions.M1()
+	local now = os.clock()
+	if not alive() or now - lastM1Send < 0.12 then
+		return
+	end
+	lastM1Send = now
+	setCooldown("M1", Config.M1.Cooldowns[1])
+	combatRemote:FireServer("M1")
+end
+
+function actions.Dash()
+	if alive() and isReady("Dash") then
+		combatRemote:FireServer("Dash")
+	end
+end
+
+function actions.Shockwave()
+	if alive() and isReady("Shockwave") then
+		combatRemote:FireServer("Shockwave")
+	end
+end
+
+function actions.BlockStart()
+	if not alive() or localBlocking then
+		return
+	end
+	localBlocking = true
+	slots.Block.stroke.Transparency = 0
+	combatRemote:FireServer("BlockStart")
+end
+
+function actions.BlockEnd()
+	if not localBlocking then
+		return
+	end
+	localBlocking = false
+	slots.Block.stroke.Transparency = 0.45
+	combatRemote:FireServer("BlockEnd")
+end
+
+local Begin, End, Cancel = Enum.UserInputState.Begin, Enum.UserInputState.End, Enum.UserInputState.Cancel
+local PASS = Enum.ContextActionResult.Pass
+
+ContextActionService:BindAction("BG_M1", function(_, state)
+	if state == Begin then
+		actions.M1()
+	end
+	return PASS
+end, false, Enum.UserInputType.MouseButton1, Enum.KeyCode.ButtonR2)
+
+ContextActionService:BindAction("BG_Dash", function(_, state)
+	if state == Begin then
+		actions.Dash()
+	end
+	return PASS
+end, false, Enum.KeyCode.Q, Enum.KeyCode.ButtonB)
+
+ContextActionService:BindAction("BG_Quake", function(_, state)
+	if state == Begin then
+		actions.Shockwave()
+	end
+	return PASS
+end, false, Enum.KeyCode.E, Enum.KeyCode.ButtonY)
+
+ContextActionService:BindAction("BG_Block", function(_, state)
+	if state == Begin then
+		actions.BlockStart()
+	elseif state == End or state == Cancel then
+		actions.BlockEnd()
+	end
+	return PASS
+end, false, Enum.KeyCode.F, Enum.KeyCode.ButtonL2)
+
+-- On-screen slot buttons (touch + mouse)
+local function isPress(input)
+	return input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1
+end
+
+slots.M1.button.InputBegan:Connect(function(input)
+	if isPress(input) then
+		actions.M1()
+	end
+end)
+slots.Dash.button.InputBegan:Connect(function(input)
+	if isPress(input) then
+		actions.Dash()
+	end
+end)
+slots.Shockwave.button.InputBegan:Connect(function(input)
+	if isPress(input) then
+		actions.Shockwave()
+	end
+end)
+slots.Block.button.InputBegan:Connect(function(input)
+	if isPress(input) then
+		actions.BlockStart()
+	end
+end)
+slots.Block.button.InputEnded:Connect(function(input)
+	if isPress(input) then
+		actions.BlockEnd()
+	end
+end)
+]]></ProtectedString></Properties></Item></Item><Item class="StarterCharacterScripts" referent="RBX10"><Properties><string name="Name">StarterCharacterScripts</string></Properties><Item class="LocalScript" referent="RBX11"><Properties><string name="Name">Animate</string><ProtectedString name="Source"><![CDATA[-- Intentionally empty: replaces Roblox's default Animate script.
+-- All animation is driven by ReplicatedStorage/ProceduralAnimator.
+]]></ProtectedString></Properties></Item></Item></Item></roblox>

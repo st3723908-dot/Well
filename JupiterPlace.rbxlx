@@ -1,0 +1,49 @@
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+<Item class="Workspace" referent="RBXW"><Properties><string name="Name">Workspace</string></Properties>
+<Item class="Model" referent="RBXM1"><Properties><string name="Name">Jupiter</string><Ref name="PrimaryPart">RBXM2</Ref></Properties>
+<Item class="Part" referent="RBXM2"><Properties>
+<string name="Name">Planet</string><bool name="Anchored">true</bool><bool name="CanCollide">true</bool>
+<token name="Shape">0</token><token name="Material">256</token><Color3uint8 name="Color3uint8">4291667320</Color3uint8>
+<Vector3 name="size"><X>20</X><Y>20</Y><Z>20</Z></Vector3>
+<CoordinateFrame name="CFrame"><X>0</X><Y>20</Y><Z>0</Z><R00>1</R00><R01>0</R01><R02>0</R02><R10>0</R10><R11>1</R11><R12>0</R12><R20>0</R20><R21>0</R21><R22>1</R22></CoordinateFrame>
+</Properties>
+<Item class="SpecialMesh" referent="RBXM3"><Properties><string name="Name">JupiterMesh</string><token name="MeshType">3</token>
+<Vector3 name="Scale"><X>1</X><Y>1</Y><Z>1</Z></Vector3></Properties></Item>
+</Item>
+<Item class="Script" referent="RBXM4"><Properties><string name="Name">JupiterLoader</string><ProtectedString name="Source"><![CDATA[--!strict
+-- Jupiter loader. Paste your uploaded asset IDs below, e.g. "rbxassetid://1234567890"
+local MESH_ID = ""
+local TEXTURE_ID = ""
+local RADIUS = 10 -- studs (the OBJ has radius 1, so this is the mesh scale)
+local SPIN = true
+local SPIN_SPEED = 0.1 -- radians per second
+
+local RunService = game:GetService("RunService")
+
+local planet = script.Parent:WaitForChild("Planet") :: Part
+local mesh = planet:WaitForChild("JupiterMesh") :: SpecialMesh
+
+if MESH_ID ~= "" and TEXTURE_ID ~= "" then
+	mesh.MeshType = Enum.MeshType.FileMesh
+	mesh.MeshId = MESH_ID
+	mesh.TextureId = TEXTURE_ID
+	mesh.Scale = Vector3.one * RADIUS
+else
+	warn("[Jupiter] MESH_ID / TEXTURE_ID not set in script '" .. script.Name .. "'. Showing plain fallback sphere.")
+	mesh.MeshType = Enum.MeshType.Sphere
+	mesh.Scale = Vector3.one
+end
+planet.Size = Vector3.one * RADIUS * 2
+
+if SPIN then
+	local baseCFrame = planet.CFrame
+	local angle = 0
+	RunService.Heartbeat:Connect(function(dt: number)
+		angle += dt * SPIN_SPEED
+		planet.CFrame = baseCFrame * CFrame.Angles(0, angle, 0)
+	end)
+end
+]]></ProtectedString></Properties></Item>
+</Item>
+</Item>
+</roblox>
